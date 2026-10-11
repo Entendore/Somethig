@@ -1,0 +1,774 @@
+# Pulse Language Specification v3.0
+**The Definitive API Reference**
+
+## Table of Contents
+1. [Introduction & Execution Model](#1-introduction--execution-model)
+2. [Type System](#2-type-system)
+3. [Lexical Grammar & Syntax](#3-lexical-grammar--syntax)
+4. [String Mini-Language](#4-string-mini-language)
+5. [Core Constructors](#5-core-constructors)
+6. [World Music Systems & Tuning](#6-world-music-systems--tuning)
+7. [Harmonic Constructs](#7-harmonic-constructs)
+8. [Rhythmic Constructs](#8-rhythmic-constructs)
+9. [Pattern Algebra & Operators](#9-pattern-algebra--operators)
+10. [Transform API: Time & Structure](#10-transform-api-time--structure)
+11. [Transform API: Pitch & Melody](#11-transform-api-pitch--melody)
+12. [Transform API: Timbre & DSP](#12-transform-api-timbre--dsp)
+13. [Transform API: Dynamics & Routing](#13-transform-api-dynamics--routing)
+14. [Transform API: Space & 3D](#14-transform-api-space--3d)
+15. [Transform API: Expression & Ornamentation](#15-transform-api-expression--ornamentation)
+16. [Synthesis Architectures (Structs)](#16-synthesis-architectures-structs)
+17. [Buffer, Tape & Granular API](#17-buffer-tape--granular-api)
+18. [Spectral Processing API](#18-spectral-processing-api)
+19. [Generative & Algorithmic API](#19-generative--algorithmic-api)
+20. [Structural & Form API](#20-structural--form-api)
+21. [Reactive, IO & Network API](#21-reactive-io--network-api)
+22. [Live Coding Primitives](#22-live-coding-primitives)
+23. [Global & Master API](#23-global--master-api)
+24. [Audio Engine & Scheduler Internals](#24-audio-engine--scheduler-internals)
+
+---
+
+## 1. Introduction & Execution Model
+
+Pulse is a declarative, cyclic pattern language for live-coded music. Code is evaluated top-to-bottom. Each expression yielding a `Pattern` registers as an independent **voice**. All voices run simultaneously within a shared **cycle** of fixed duration (4 beats at the current BPM). A pattern's length determines its subdivision (e.g., 4 steps = quarter notes, 8 steps = eighth notes).
+
+### Paradigms
+- **Transform-Centric**: All patterns are immutable. Functions return new patterns.
+- **Time-Polymorphic**: Voices can operate in independent time signatures, tempos, and tuning systems simultaneously.
+- **Reactive**: Patterns can be driven by external asynchronous data streams (WebSockets, HTTP, Sensors).
+- **Deterministic Pseudo-Randomness**: All stochastic functions are seeded by `(step, cycle)`, ensuring reproducibility.
+
+---
+
+## 2. Type System
+
+| Type | Description |
+|------|-------------|
+| `Pattern` | A pure function `(step: int, cycle: int) → Value \| null`, bundled with a `length: int` and `meta: Record`. |
+| `Value` | `string` (drum), `number` (Hz), `{type: "degree", value: int}`, `{type: "note", value: string}`, `{type: "chord", values: number[]}`, or `null` (rest). |
+| `StructDef` | A configuration object defining a synthesis algorithm and its parameters. |
+| `Predicate` | A function `(step: int, cycle: int) → bool`. |
+| `Function` | A lambda `x => expr` used in higher-order transforms. |
+| `Buffer` | An in-memory array of audio samples. |
+| `Stream` | An asynchronous sequence of values from external I/O. |
+
+### Pattern Metadata Record
+Attached to every pattern, merged/overridden during transforms.
+```javascript
+{
+  speed: 1, gain: 1, reverb: 0, delay: 0, filter: null, 
+  resonance: 2, scale: "minor", swing: 0, orbit: 0, pan: 0,
+  struct: null, velocity: 1, legato: false, degrade: 0, 
+  crunch: 0, distort: 0, wobbleRate: 0, wobbleDepth: 0, 
+  tempo: 1, signature: null, space: [0,0,0], trajectory: null
+}
+```
+
+---
+
+## 3. Lexical Grammar & Syntax
+
+```ebnf
+program      → (assignment | expression | comment)*
+assignment   → "!"? IDENT "=" expression
+expression   → bexpr ( "." IDENT "(" args ")" )*
+bexpr        → call ( ("+" | "-" | "&" | "|" | "^") call )*
+call         → primary ( "(" args ")" )*
+primary      → STRING
+             | NUMBER
+             | IDENT ( "=>" expression )?
+             | "(" expression ")"
+             | "[" expression ("," expression)* "]"
+args         → expression ("," expression)*
+comment      → "//" to end of line
+```
+*Note: `!` prefix on assignment forces a hard-reset of the voice during hot-swap.*
+
+---
+
+## 4. String Mini-Language
+
+Parsed inside double quotes `"..."`.
+
+| Syntax | Behavior | Example |
+|--------|----------|---------|
+| `word` | Sound name or degree | `"bd"`, `"0"` |
+| `~` | Rest (null) | `"bd ~ sd"` |
+| `[...]` | Flatten inline | `"bd [sd hh] oh"` |
+| `<...>` | Rotation group (+1 offset/cycle) | `"<bd sd hh>"` |
+| `*n` | Repeat token | `"bd*3"` → `"bd bd bd"` |
+| `?` | 50% probability | `"bd?"` |
+| `!n` | 1/n probability | `"bd!4"` (25%) |
+| `$name` | Variable interpolation | `x="sd"; "bd $x"` |
+
+---
+
+## 5. Core Constructors
+
+### `s(string) → Pattern`
+Parses string as scale-degree pattern.
+```pulse
+s("0 2 4 ~ 7") // Degrees of current global scale
+```
+
+### `n(string) → Pattern`
+Parses string as absolute note names (e.g., `"c4"`, `"f#5"`, `"bb3"`).
+```pulse
+n("c4 e4 g4")
+```
+
+### `stack(p1, p2, ...) → Pattern`
+Layers patterns. Values become arrays.
+```pulse
+stack("bd", "hh") // ["bd", "hh"] per step
+```
+
+### `cat(p1, p2, ...) → Pattern`
+Concatenates patterns sequentially. Length is sum of inputs.
+```pulse
+cat("bd sd", "hh oh") // Length 4
+```
+
+### `silence(length) → Pattern`
+Pattern of `length` rests.
+```pulse
+silence(8)
+```
+
+### `range(start, end, step) → Pattern`
+Arithmetic sequence.
+```pulse
+range(0, 12, 2) // [0, 2, 4, 6, 8, 10]
+```
+
+### `struct(record) → StructDef`
+Defines a synthesizer. Not a pattern; used as a callable prefix.
+```pulse
+acid = struct({wave: "sawtooth", cutoff: 800})
+acid(s("0 3")) // Applies struct to pattern
+```
+
+---
+
+## 6. World Music Systems & Tuning
+
+### Global Tuning
+```pulse
+tuning(12)      // 12-TET (Default)
+tuning(24)      // Quarter-tone
+tuning(5)       // Slendro approximation
+tuning("just")  // Just Intonation
+```
+
+### Scale Systems
+**Western**: `major`, `minor`, `harmonicMinor`, `melodicMinor`, `dorian`, `phrygian`, `lydian`, `mixolydian`, `locrian`, `pentatonic`, `minorPentatonic`, `blues`, `wholeTone`, `diminished`, `augmented`, `bebopDominant`, `bebopMajor`, `harmonicMajor`, `doubleHarmonic`.
+**Eastern**: `minyo`, `in`, `yo`, `miyako`, `ritsu`, `chineseGong`, `chineseShang`, `chineseJiao`, `chineseZhi`, `chineseYu`, `pelog`, `slendro`.
+**African**: `africanHeptatonic`, `africanPentatonic`, `mbira`, `highlife`, `kora`.
+**Indigenous**: `plainsFlute`, `navajo`, `inuit`, `lakota`, `anishinaabe`.
+
+### `raga(record) → ScaleDef`
+```pulse
+raga({
+  name: "Bhairavi",
+  arohana: [0, 1, 3, 4, 6, 7, 8, 10, 11],
+  avarohana: [11, 10, 8, 7, 6, 4, 3, 1, 0],
+  vadi: 4, samvadi: 10,
+  pakad: [0, 1, 4, 3, 1, 0]
+})
+```
+
+### `maqam(record) → ScaleDef`
+Requires `tuning(24)`.
+```pulse
+maqam({
+  name: "Rast",
+  intervals: [0, 3, 5, 7, 10, 12, 15, 17],
+  root: 0, ghammaz: 10
+})
+```
+
+### `jiScale(ratios[]) → ScaleDef`
+```pulse
+jiScale([1/1, 9/8, 5/4, 4/3, 3/2, 5/3, 15/8])
+```
+
+---
+
+## 7. Harmonic Constructs
+
+### `chord(degrees[], pattern) → Pattern`
+Wraps degree pattern to output multi-frequency chords.
+```pulse
+chord([0, 4, 7], s("0 5")) // Major triads on 0 and 5
+```
+
+### `arp(direction, pattern) → Pattern`
+Arpeggiates chord patterns. Directions: `"up"`, `"down"`, `"updown"`, `"downup"`.
+```pulse
+arp("up", chord([0,4,7], s("0 ~ 5 ~")))
+```
+
+### `triad(root, type, pattern) → Pattern`
+Types: `"major"`, `"minor"`, `"diminished"`, `"augmented"`, `"sus2"`, `"sus4"`.
+```pulse
+triad(0, "minor", s("0 ~ 4 ~"))
+```
+
+### `seventh(root, type, pattern) → Pattern`
+Types: `"maj7"`, `"min7"`, `"dom7"`, `"m7b5"`, `"dim7"`.
+
+### `extended(root, type, pattern) → Pattern`
+Types: `"maj9"`, `"min9"`, `"dom9"`, `"maj11"`, `"min11"`, `"dom13"`, `"min13"`.
+
+### `prog(degrees[]) → ProgressionDef`
+Defines harmonic movement.
+```pulse
+prog([0, 5, 7, 0])
+```
+
+### `voiceLead(pattern) → Pattern`
+Smooths chord-to-chord transitions to minimize voice movement.
+
+---
+
+## 8. Rhythmic Constructs
+
+### `euclid(n, k, pattern?) → Pattern`
+Bjorklund algorithm. Distributes `k` hits over `n` steps.
+```pulse
+euclid(8, 5, "bd")
+euclid(12, 7, s("0 3"))
+```
+
+### `timeline(style, sound) → Pattern`
+Culturally accurate bell patterns. Auto-sets time signature.
+Styles: `"ewe"`, `"yoruba"`, `"son"`, `"rumba"`, `"bembe"`.
+```pulse
+timeline("son", "cb") // 4/4 Clave
+```
+
+### `tala(name, sound) → Pattern`
+Indian rhythmic cycles. Names: `"teentaal"`, `"jhaptaal"`, `"rupak"`, `"ektaal"`.
+```pulse
+tala("teentaal", "bd")
+```
+
+### `tihai(repetitions, pattern) → Pattern`
+Resolving cadential repetition landing on the downbeat.
+```pulse
+tala("teentaal", "bd").tihai(3)
+```
+
+### `rand(string, length) → Pattern`
+Deterministic random selection per cycle.
+```pulse
+rand("bd sd hh oh", 8)
+```
+
+### `weighted(map, length) → Pattern`
+Probability-weighted random selection.
+```pulse
+weighted({"bd": 0.5, "sd": 0.3, "hh": 0.2}, 8)
+```
+
+---
+
+## 9. Pattern Algebra & Operators
+
+Operate on the time-domain (presence/absence of events).
+
+| Op | Name | Semantics |
+|----|------|-----------|
+| `+` | Add | Element-wise value arithmetic (degrees/numbers). |
+| `-` | Subtract | Element-wise arithmetic. |
+| `&` | Intersection | Event fires only if *both* patterns yield non-null. Takes left value. |
+| `\|` | Union | Event fires if *either* yields non-null. Left takes priority. |
+| `^` | XOR | Event fires if *only one* yields non-null. |
+
+*Note: Different lengths are aligned via LCM time-stretching.*
+
+```pulse
+drums = "bd ~ bd ~" | "~ sd ~ ~"
+syncopation = "cp ~ cp ~" - "bd ~ bd ~"
+bass = s("0 2 4") + s("0 7 12") // [0, 9, 16]
+```
+
+---
+
+## 10. Transform API: Time & Structure
+
+*All transforms can be called as `f(pattern)` or `pattern.f()`.*
+
+### `slow(n, pattern) → Pattern`
+Divides speed by `n`.
+### `fast(n, pattern) → Pattern`
+Multiplies speed by `n`.
+### `rev(pattern) → Pattern`
+Reverses step order.
+### `stretch(n, pattern) → Pattern`
+Repeats each step `n` times (duplicates events).
+### `brak(pattern) → Pattern`
+Breakbeat pull: shifts even steps slightly forward.
+### `tempo(multiplier, pattern) → Pattern`
+Per-voice tempo multiplier independent of global BPM.
+### `repeat(n, pattern) → Pattern`
+Repeats the entire pattern sequence `n` times (multiplies length).
+### `swing(amount, pattern) → Pattern`
+`amount` 0-1. Delays odd steps, pulls even steps early.
+### `sig(num, den, pattern) → Pattern`
+Applies a specific time signature to the voice.
+### `every(n, lambda, pattern) → Pattern`
+Applies lambda every `n`-th cycle.
+### `sometimes(lambda, pattern) → Pattern`
+Applies lambda on ~50% of cycles.
+### `often(lambda, pattern) → Pattern`
+~75% of cycles.
+### `rarely(lambda, pattern) → Pattern`
+~25% of cycles.
+### `never(lambda, pattern) → Pattern`
+0% (useful for live-coding muting).
+### `when(predicate, pattern) → Pattern`
+Plays only when predicate returns truthy.
+### `mask(boolPattern, valuePattern) → Pattern`
+Gates valuePattern by boolPattern's null/non-null state.
+### `slice(a, b, pattern) → Pattern`
+Extracts step range `[a, b)`.
+### `compress(pattern) → Pattern`
+Removes all nulls, packing events tightly.
+
+---
+
+## 11. Transform API: Pitch & Melody
+
+### `octave(n, pattern) → Pattern`
+Transposes degrees by `(n - 4) * 7`.
+### `scale(name, pattern?) → Pattern`
+Overrides scale for this voice. Standalone sets global scale.
+### `transpose(semitones, pattern) → Pattern`
+Shifts by absolute semitones.
+### `invert(axis, pattern) → Pattern`
+Inverts pitches around `axis` degree.
+### `detune(cents, pattern) → Pattern`
+Shifts frequency by absolute cents.
+### `spreadCents(cents[], pattern) → Pattern`
+Applies cent array to pattern steps.
+
+---
+
+## 12. Transform API: Timbre & DSP
+
+### `gain(v, pattern) → Pattern`
+Multiplies amplitude (clamped at output).
+### `velocity(v, pattern) → Pattern`
+Scales envelope depth 0-1.
+### `filter(hz, pattern) → Pattern`
+Lowpass cutoff frequency.
+### `resonance(q, pattern) → Pattern`
+Filter Q value.
+### `reverb(amount, pattern) → Pattern`
+Send level 0-1 to global convolution reverb.
+### `delay(amount, pattern) → Pattern`
+Send level 0-1 to global feedback delay.
+### `distort(amount, pattern) → Pattern`
+Soft-clip waveshaping 0-1.
+### `crush(bits, pattern) → Pattern`
+Bitcrushing (1-16 bits).
+### `lofi(pattern) → Pattern`
+Convenience: `crush(8).filter(1500).distort(0.2)`.
+### `phaser(rate, depth, pattern) → Pattern`
+Phasing effect.
+### `flanger(rate, depth, pattern) → Pattern`
+Flanging effect.
+### `wobble(rate, depth, pattern) → Pattern`
+LFO on filter cutoff. `depth` in Hz.
+### `tremolo(rate, depth, pattern) → Pattern`
+Amplitude LFO.
+### `adsr(a, d, susLvl, r, pattern) → Pattern`
+Full 4-stage envelope.
+### `attack(t, pattern) → Pattern`
+Sets attack time in seconds.
+### `release(t, pattern) → Pattern`
+Sets release time in seconds.
+### `legato(pattern) → Pattern`
+Prevents retriggering; slides frequency to next note.
+### `modulate(paramName, pattern) → Pattern`
+Uses pattern values to dynamically modulate a struct parameter.
+
+---
+
+## 13. Transform API: Dynamics & Routing
+
+### `duck(trigger, value, amount, release) → Pattern`
+Sidechain compression. `amount` 0-1 duck depth.
+### `compress(thresh, ratio, atk, rel, pattern) → Pattern`
+Dynamic range reduction.
+### `gate(thresh, atk, rel, pattern) → Pattern`
+Silences signal below threshold.
+### `limit(ceiling, pattern) → Pattern`
+Brick-wall limiter.
+### `bus(name, config) → BusDef`
+Creates custom auxiliary routing graph.
+### `send(busName, amount, pattern) → Pattern`
+Routes pattern to custom bus.
+
+---
+
+## 14. Transform API: Space & 3D
+
+### `orbit(n, pattern) → Pattern`
+Stereo panning slot 0-3 (Far-L, Center-L, Center-R, Far-R).
+### `pan(v, pattern) → Pattern`
+Continuous pan -1.0 to +1.0. Overrides orbit.
+### `spread(amount, pattern) → Pattern`
+Spreads chord voices across stereo field.
+### `space(x, y, z, pattern) → Pattern`
+3D HRTF positioning. `x` L/R, `y` Floor/Ceiling, `z` Near/Far.
+### `trajectory(shape, speed, radius, pattern) → Pattern`
+Automated 3D movement. Shapes: `"circle"`, `"lissajous"`, `"spiral"`, `"bounce"`, `"randomWalk"`.
+### `phase(offset, pattern) → Pattern`
+Offsets trajectory start position 0.0-1.0.
+### `doppler(factor, pattern) → Pattern`
+Applies pitch shifting based on 3D velocity vector.
+
+---
+
+## 15. Transform API: Expression & Ornamentation
+
+### `meend(targetDeg, pattern) → Pattern`
+Indian continuous pitch slide.
+### `gamaka(depth, rate, pattern) → Pattern`
+Indian pitch oscillation (Andolan).
+### `mordent(offsetDeg, pattern) → Pattern`
+Rapid single alternation.
+### `trill(targetDeg, rate, pattern) → Pattern`
+Continuous rapid alternation.
+### `bend(semitones, time, pattern) → Pattern`
+Blues/jazz pitch bend peaking at `time` (0-1).
+### `fall(startPoint, pattern) → Pattern`
+Pitch drop at end of note.
+### `doit(startPoint, pattern) → Pattern`
+Pitch shoot up at end of note.
+### `breath(time, pattern) → Pattern`
+Simulates wind instrument pressure ramp.
+### `overblow(harmonic, pattern) → Pattern`
+Forces specific harmonic.
+### `growl(amount, pattern) → Pattern`
+Jazz growl/subtone texture.
+### `pakad(pattern) → Pattern`
+Inserts raga's characteristic phrase at cycle start.
+### `sayr(pattern) → Pattern`
+Applies maqam traditional melodic progression rules.
+
+---
+
+## 16. Synthesis Architectures (Structs)
+
+Defined via `struct({...})`. Used as callable prefix: `mySynth(pattern)`.
+
+### Default
+Keys: `wave` (string), `attack` (s), `release` (s), `cutoff` (Hz), `reso` (Q), `detune` (cents), `distort` (0-1), `crush` (1-16).
+
+### FM Synthesis
+Type: `"fm"`
+| Key | Type | Description |
+|-----|------|-------------|
+| `carrier` | number | Carrier frequency ratio |
+| `modulator` | number | Modulator frequency ratio |
+| `index` | number | FM Index (brightness) |
+| `feedback` | number | Modulator self-feedback 0-1 |
+
+### Additive Synthesis
+Type: `"additive"`
+| Key | Type | Description |
+|-----|------|-------------|
+| `partials` | number[] | Amplitudes of harmonics 1, 2, 3... |
+
+### Wavetable Synthesis
+Type: `"wavetable"`
+| Key | Type | Description |
+|-----|------|-------------|
+| `table` | number[][] | Array of frames, each an array of partial amplitudes |
+| `position` | number | Start position 0-1 |
+| `speed` | number | Scan speed through table |
+
+### Phase Distortion
+Type: `"phaseDistort"`
+| Key | Type | Description |
+|-----|------|-------------|
+| `amount` | number | 0 (sine) to 1 (square) |
+| `reso` | number | Resonance bump at distortion point |
+
+### Karplus-Strong (Plucked String)
+Type: `"karplus"`
+| Key | Type | Description |
+|-----|------|-------------|
+| `exciter` | string | `"noise"` or `"sine"` |
+| `brightness` | number | 0 (dark) to 1 (bright) |
+| `damping` | number | Sustain decay factor 0-1 |
+
+### Modal Synthesis (Resonant Bodies)
+Type: `"modal"`
+| Key | Type | Description |
+|-----|------|-------------|
+| `modes` | object[] | Array of `{freq: ratio, decay: seconds}` |
+| `exciter` | string | `"impulse"` or `"noise"` |
+
+### Wind/Tube Modeling
+Type: `"wind"`
+| Key | Type | Description |
+|-----|------|-------------|
+| `tubeLength` | number | Relative length to root freq |
+| `breathPressure` | number | 0-1 |
+| `reedStiffness` | number | For double reeds |
+| `vibrato` | number | Rate in Hz |
+
+---
+
+## 17. Buffer, Tape & Granular API
+
+### `rec(seconds) → Buffer`
+Records master output into memory buffer.
+
+### `Buffer.play() → Pattern`
+Plays buffer back as a pattern.
+
+### `Buffer.slice(n) → SlicePattern`
+Chops buffer into `n` equal slices. Query with degree pattern.
+
+### `tapeSpeed(multiplier, pattern) → Pattern`
+Pitch/speed manipulation.
+
+### `wow(depth, pattern) → Pattern`
+Slow tape wobble.
+
+### `flutter(rate, pattern) → Pattern`
+Fast tape flutter.
+
+### `cloud(buffer, config) → Pattern`
+Advanced granular synthesis.
+Config Keys: `density` (grains/sec), `length` `[min, max]`, `position` `[min, max]`, `pitch` `[min, max]`, `spread` (0-1), `shape` (`"hann"`, `"sine"`, `"perc"`).
+
+### `Buffer.freeze() → FrozenBuffer`
+Locks buffer playback position for drone creation.
+
+### `FrozenBuffer.scrub(posPattern) → Pattern`
+Modulates frozen position with a 0.0-1.0 pattern.
+
+---
+
+## 18. Spectral Processing API
+
+### `spectralFreeze(pattern) → Pattern`
+Captures FFT frame on trigger, sustains infinitely.
+
+### `vocod(carrier, modulator) → Pattern`
+Applies modulator's spectral envelope to carrier's harmonics.
+
+### `spectralShift(semitones, pattern) → Pattern`
+Shifts FFT bins, creating inharmonic metallic textures.
+
+### `spectralDelay(time, pattern) → Pattern`
+Frequency-dependent delay times (smearing effect).
+
+---
+
+## 19. Generative & Algorithmic API
+
+### `automata(rule, length, seed) → Pattern`
+1D Elementary Cellular Automata (e.g., Rule 30, 90, 110).
+
+### `markov(record) → Pattern`
+First-order Markov chain.
+Keys: `states` (string[]), `matrix` (number[][]), `seed` (string), `length` (int).
+
+### `drunk(start, minStep, maxStep, minBound, maxBound, length) → Pattern`
+Brownian motion random walk bounded by limits.
+
+### `fractal(seedPattern, targetLength, mutation) → Pattern`
+Midpoint displacement. Self-similar rhythm generation.
+
+### `lSystem(record) → Pattern`
+Lindenmayer system.
+Keys: `axiom` (string), `rules` (object), `iterations` (int), `map` (object mapping chars to values).
+
+### `memo(pattern) → Pattern`
+Caches evaluations per `(step, cycle)` to optimize heavy logic.
+
+### `heavy(pattern) → Pattern`
+Offloads evaluation to Web Worker to prevent audio thread blocking.
+
+### `shape(type, params) → ValuePattern`
+Maps geometry to values over `steps`.
+Types: `"line"`, `"sine"`, `"circle"`.
+Example: `shape("sine", {min: 200, max: 5000, steps: 32})`
+
+### `image(2DArray) → ImageObject`
+Creates object from pixel data.
+`ImageObject.sonify(mapping)` mappings: `"time"`, `"pitch"`, `"gain"`.
+
+---
+
+## 20. Structural & Form API
+
+### `fsm(record) → StateMachine`
+Finite State Machine for long-form arrangement.
+Keys:
+- `states`: Object mapping state names to `{bpm: int, voices: Function[]}`.
+- `transitions`: Object mapping `stateName => {after: int, go: "state"}` or `{when: predicate, go: "state"}`.
+- `initial`: String name of starting state.
+Methods: `fsm.play()`, `fsm.osc(...)`.
+
+### `timeline_arr(arr) → Arrangement`
+Linear, non-looping score.
+Array of `{dur: "Xs", voices: Function[]}`.
+
+---
+
+## 21. Reactive, IO & Network API
+
+### `http(url, intervalSec) → DataStream`
+Fetches JSON, yields data stream.
+
+### `ws(url) → WebSocketStream`
+Connects to WebSocket, yields high-frequency data stream.
+
+### `watch(filepath) → FileStream`
+Watches local file for text pattern changes.
+
+### `Stream.map(lambda) → Stream`
+Transforms stream values.
+
+### `Stream.toPattern(length) → Pattern`
+Converts stream to queryable pattern.
+
+### `osc(ip, port, path, pattern) → Pattern`
+Sends pattern events as OSC messages.
+
+### `oscIn(ip, port, path) → ValueStream`
+Receives OSC to use as parameter control.
+
+### `midi(channel, pattern) → Pattern`
+Sends pattern as MIDI notes.
+
+### `midiDrum(channel, pattern) → Pattern`
+Sends pattern as MIDI drum notes.
+
+### `link(bool) → null`
+Enables/disables Ableton Link clock sync.
+
+### `linkStart() → null`
+Starts Link transport.
+
+### `linkBpm(bpm) → null`
+Proposes tempo to Link session.
+
+### `room(name) → RoomContext`
+Joins a WebRTC peer collaboration room.
+
+### `share(id, pattern) → null`
+Broadcasts pattern state to room peers.
+
+### `consume(id, roomContext) → Pattern`
+Receives pattern state from peers.
+
+### `broadcast() → null`
+Sends bound variables to peers.
+
+### `loadModel(path) → NeuralModel`
+Loads local neural audio model (e.g., RAVE).
+
+### `NeuralModel.lerp(zA, zB, tPattern) → Pattern`
+Interpolates through latent space.
+
+### `NeuralModel.xy(xPat, yPat) → Pattern`
+Maps patterns to 2D latent coordinates.
+
+### `transfer(textureBuffer, rhythmPattern) → Pattern`
+Neural timbre transfer.
+
+---
+
+## 22. Live Coding Primitives
+
+### `!name = expr`
+Bang operator. Hard-resets voice `name` on evaluation. Clears scheduled nodes and resets step/cycle counters to 0. Prevents overlapping audio layers during structural changes.
+
+### `~> alias = expr`
+Re-evaluating alias. `alias` dynamically mirrors the source expression. If source changes, alias follows on the next cycle without needing explicit re-evaluation.
+
+### `state(initialValue) → StateCell`
+Mutable memory cell across cycles.
+```pulse
+idx = state(0)
+s("idx").map(x => x + 1)
+when(cycle() % 16 == 0, idx.set(0))
+```
+
+### `scrub(position, pattern) → Pattern`
+Instantly jumps playback position (0.0-1.0) without waiting for cycle loop.
+
+### `asDegree(pattern) → Pattern`
+Type guard. Silences non-degree values (converts strings to null).
+
+### `asDrum(pattern) → Pattern`
+Type guard. Silences non-string values (converts numbers to null).
+
+---
+
+## 23. Global & Master API
+
+### `scale(name) → null`
+Sets the global scale for all subsequent `s()` patterns.
+
+### `tuning(system) → null`
+Sets global tuning system (12, 24, "just", etc.).
+
+### `masterTempo(targetBpm, rampSeconds) → null`
+Ramps global BPM to target over duration.
+
+### `masterCompress(thresh, ratio, atk, rel) → null`
+Applies dynamic range compression to master output.
+
+### `masterGain(v) → null`
+Sets master output volume 0-1.
+
+### `masterRec(filename) → null`
+Records master output to WAV file.
+
+---
+
+## 24. Audio Engine & Scheduler Internals
+
+### Graph Routing
+```
+Pattern → Struct/Synth → Voice FX (Distort/Crush/Tremolo)
+   ├──→ Dry Gain ──→ Orbit/Spatial Pan ──┐
+   ├──→ Reverb Send ──→ Convolver ────────┤
+   └──→ Delay Send ──→ Feedback Delay ────┤
+                                            ▼
+                                      Master Bus
+                                            │
+                              ┌─────────────┴─────────────┐
+                              │ Master Comp → Master Gain  │
+                              └─────────────┬─────────────┘
+                                            ▼
+                                      Analyser Node
+                                            ▼
+                                     Audio Destination
+```
+
+### Scheduling Math
+- **Cycle Duration**: `C = (4 * 60) / BPM`
+- **Step Duration**: `S = C / (Pattern.length * Pattern.meta.speed * Pattern.meta.tempo)`
+- **Swing Offset**: `if step % 2 == 1: S *= (1 + swing); else: S *= (1 - swing * 0.5)`
+- **Time Signature Override**: If `sig(n, d)`, `C = (n / d) * (60 / BPM) * 4`
+
+### Determinism Hash
+All stochastic functions use: `hash = ((step * 2654435761) + (cycle * 40503)) >>> 0) % 10000`
+
+### Hot-Swap Rules
+1. Error in new code → Old voices persist. Error displayed.
+2. Pattern length change → Step wraps to `step % new_length`.
+3. `!` prefix → Audio nodes disconnect immediately. Step/Cycle reset to 0.
+4. Metadata changes (gain, fx) → Apply on next scheduled `AudioContext.time` event.
